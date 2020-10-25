@@ -95,21 +95,22 @@ typedef unsigned char byte;
 	- end of text,
 	- non-terminal, or
 	- grouping of alternatives.
-	An element can have modifiers for making the element optional or an
-	sequence. It is also possible to specify that an optional and/or
-	sequential element should be avoided in favour of the remaining rule.
+	An element can have modifiers for making the element optional or a sequence.
+	It is also possible to specify that an optional and/or sequential element
+	should be avoided in favour of the remaining rule.
 	With a sequential element it is possible to define a chain rule, which is
-	to appear between the elements.
-	Each element has a number of function pointers, which can be used to
-	specify functions which should be called to process the parsing results.
-	Furthermore, each alternative has a function pointer, to specify the
-	function that should be called at the end of the rule to process the
-	result.
+	to appear between the elements. An example of this is a comma separated
+	list of elements, where the comma (and possible white space) is the chain
+	rule.
+	Each element has a number of function pointers, which can be used to specify
+	functions that should be called to process the parsing results. Furthermore,
+	each alternative has a function pointer, to specify the function that should
+	be called at the end of the rule to process the result.
 	
 	An example for a white space grammar will follow.
 */
 
-/*  Forward declarations of types to be defined later.  */
+/*  Forward declarations of types of the grammar definition.  */
 
 typedef struct non_terminal non_terminal_t, *non_terminal_p;
 typedef struct alternative *alternative_p;
@@ -127,6 +128,8 @@ struct non_terminal
 	alternative_p recursive;  /* Left-recursive alternatives */
 	non_terminal_p next;      /* Next non-terminal (in the list) */
 };
+
+/*  - Function to find a non-terminal on a name or add a new to end of list */
 
 non_terminal_p find_nt(char *name, non_terminal_p *p_nt)
 {
@@ -150,25 +153,32 @@ typedef bool (*end_function_p)(const result_p rule_result, void* data, result_p 
 struct alternative
 {
 	element_p rule;               /* The rule definition */
-	end_function_p end_function;  /* Function pointer */
-	void *end_data;               /* Some additional data based to end_function */
+	
+	/* Function pointer to an optional function that is to be called when rule
+	   is parsed. Input arguments are the result of the rule and a pointer to
+	   some additional data. The output is the result to be returned by the
+	   alternative. When the function pointer is null, the result of the rule is
+	   taken as the result of the alternative. */
+	end_function_p end_function;
+	void *end_function_data;      /* Pointer to additional data which is passed to end_function */
+	
 	alternative_p next;           /* Next alternative */
 };
+
+/*  - Function to create a new alternative */
 
 alternative_p new_alternative()
 {
 	alternative_p alternative = MALLOC(struct alternative);
 	alternative->rule = NULL;
 	alternative->end_function = NULL;
-	alternative->end_data = NULL;
+	alternative->end_function_data = NULL;
 	alternative->next = NULL;
 	return alternative;
 }
 
 /*  
 	Defintion of an element of a rule.
-
-	(Some members of the element struct will be explained below.)	
 */
 
 enum element_kind_t
@@ -196,15 +206,36 @@ struct element
 		const char *(*terminal_function)(const char *input, result_p result);
 		                             /* rk_term: Pointer to user defined terminal scan function */
 	} info;
+	
+	/* Function pointer to an optional  Boolean function that is called after the
+	   element is parsed. When the function returns false, parsing fails. The
+	   function is called with the result of the element and a pointer to an
+	   additional argument. When the function pointer is null, it is equivalent
+	   with a function that always returns true. */
 	bool (*condition)(result_p result, const void *argument);
 	const void *condition_argument;
+	
+	/* Function pointer to an optional Boolean function that is called after the
+	   element is parsed and after the optional condition function has been called,
+	   to combine the result of the previous elements with the element into the
+	   result to be passed to the remainder of the rule. When the function returns
+	   false, parsing fails. When the function pointer is null, it is equivalent
+	   with a function that always returns true and simple sets the result as the
+	   result of the previous element, thus discarding the result of the element.
+	   This is, for example used, when the element is a literal character. */
 	bool (*add_function)(result_p prev, result_p elem, result_p result);
-	bool (*add_char_function)(result_p prev, char ch, result_p result);
-	bool (*add_seq_function)(result_p prev, result_p seq, result_p result);
+	
 	bool (*add_skip_function)(result_p prev, result_p result);
+
+	bool (*add_char_function)(result_p prev, char ch, result_p result);
+
+	bool (*add_seq_function)(result_p prev, result_p seq, result_p result);
+
 	void (*set_pos)(result_p result, text_pos_p ps);
+
 	void (*begin_seq_function)(result_p prev, result_p seq);
-	element_p next;
+
+	element_p next;             /* Next element in the rule */   
 };
 
 element_p new_element(enum element_kind_t kind)
@@ -310,6 +341,7 @@ void element_print(FILE *f, element_p element)
 #define NTF(N,F) _NEW_GR(rk_nt) element->info.non_terminal = find_nt(N, _nt); element->add_function = F;
 #define END _NEW_GR(rk_end)
 #define SEQ(S,E) element->sequence = TRUE; element->begin_seq_function = S; element->add_seq_function = E;
+#define CHAIN(S, E) SEQ(S,E) { element_p* ref_element = &element->chain_rule; element_p element;
 #define OPT(F) element->optional = TRUE; element->add_skip_function = F;
 #define AVOID element->avoid = TRUE;
 #define SET_PS(F) element->set_pos = F;
@@ -848,7 +880,7 @@ bool parse_rule(parser_p parser, element_p element, const result_p prev_result, 
 		/* At the end of the rule: */
 		if (alternative->end_function == 0)
 			result_assign(rule_result, prev_result);
-		else if (!alternative->end_function(prev_result, alternative->end_data, rule_result))
+		else if (!alternative->end_function(prev_result, alternative->end_function_data, rule_result))
 		{
 			DEBUG_EXIT("parse_rule failed by end function "); DEBUG_NL;
 			return FALSE;
@@ -866,10 +898,10 @@ bool parse_rule(parser_p parser, element_p element, const result_p prev_result, 
 	   will be made to skip the element and parse the remainder of the rule */
 	if (element->optional && element->avoid)
 	{
-		/* If a add skip function is defined, apply it. (A add skip function
+		/* If a add skip function is defined, apply it. (An add skip function
 		   can be used to process the absence of the element with the result.)
 		   Otherwise, if a add function is defined, it will be called with an
-		   'empty' result, signaling that there no element was parsed.
+		   'empty' result, signaling that no element was parsed.
 		   Otherwise, the previous result is used. */
 		DECL_RESULT(skip_result);
 		if (element->add_skip_function != NULL)
@@ -1799,13 +1831,12 @@ bool add_seq_as_list(result_p prev, result_p seq, result_p result)
 }
 
 #define NT(S) NTF(S, add_child)
-#define PASS alternative->end_function = pass_tree;
-#define TREE(N) alternative->end_function = make_tree; alternative->end_data = N;
-#define KEYWORD(K) NTF("ident", 0) element->condition = equal_string; element->condition_argument = string(K); *keyword_state = 1;
-#define CHAIN(X)  /* TODO */
-#define OPTN OPT(0)
-#define IDENT NTF("ident", add_child) element->condition = not_a_keyword;
 #define WS NT("white_space")
+#define PASS alternative->end_function = pass_tree;
+#define TREE(N) alternative->end_function = make_tree; alternative->end_function_data = N;
+#define KEYWORD(K) NTF("ident", 0) element->condition = equal_string; element->condition_argument = string(K); *keyword_state = 1; WS
+#define OPTN OPT(0)
+#define IDENT NTF("ident", add_child) element->condition = not_a_keyword; WS
 #define SEQL SEQ(0, add_seq_as_list)
 
 void c_grammar(non_terminal_p *all_nt)
@@ -1813,314 +1844,314 @@ void c_grammar(non_terminal_p *all_nt)
 	HEADER(all_nt)
 	
 	NT_DEF("primary_expr")
-	RULE IDENT
-	RULE NT("int")
-	RULE NT("double")
-	RULE NT("char")
-	RULE NT("string")
-	RULE CHAR('(') NT("expr") CHAR(')')
+		RULE IDENT
+		RULE NT("int")
+		RULE NT("double")
+		RULE NT("char")
+		RULE NT("string")
+		RULE CHAR('(') WS NT("expr") CHAR(')') WS
 
 	NT_DEF("postfix_expr")
-	RULE NT("primary_expr")
-	REC_RULE CHAR('[') NT("expr") CHAR(']') TREE("arrayexp")
-	REC_RULE CHAR('(') NT("assignment_expr") CHAIN(",") OPTN CHAR(')') TREE("call")
-	REC_RULE CHAR('.') IDENT TREE("field")
-	REC_RULE CHAR('-') CHAR('>') IDENT TREE("fieldderef")
-	REC_RULE CHAR('+') CHAR('+') TREE("post_inc")
-	REC_RULE CHAR('-') CHAR('-') TREE("post_dec")
+		RULE NT("primary_expr")
+		REC_RULE CHAR('[') WS NT("expr") CHAR(']') TREE("arrayexp")
+		REC_RULE CHAR('(') WS NT("assignment_expr") CHAIN(0,0) CHAR(",") WS CLOSE OPTN CHAR(')') TREE("call")
+		REC_RULE CHAR('.') WS IDENT TREE("field")
+		REC_RULE CHAR('-') CHAR('>') WS IDENT TREE("fieldderef")
+		REC_RULE CHAR('+') CHAR('+') WS TREE("post_inc")
+		REC_RULE CHAR('-') CHAR('-') WS TREE("post_dec")
 
 	NT_DEF("unary_expr")
-	RULE CHAR('+') CHAR('+') NT("unary_expr") TREE("pre_inc")
-	RULE CHAR('-') CHAR('-') NT("unary_expr") TREE("pre_dec")
-	RULE CHAR('&') NT("cast_expr") TREE("address_of")
-	RULE CHAR('*') NT("cast_expr") TREE("deref")
-	RULE CHAR('+') NT("cast_expr") TREE("plus")
-	RULE CHAR('-') NT("cast_expr") TREE("min")
-	RULE CHAR('~') NT("cast_expr") TREE("invert")
-	RULE CHAR('!') NT("cast_expr") TREE("not")
-	RULE KEYWORD("sizeof")
-	OPEN
-		RULE NT("unary_expr") TREE("typeof")
-		RULE CHAR('(') IDENT CHAR(')')
-	CLOSE TREE("sizeof")
-	RULE NT("postfix_expr")
+		RULE CHAR('+') CHAR('+') WS NT("unary_expr") TREE("pre_inc")
+		RULE CHAR('-') CHAR('-') WS NT("unary_expr") TREE("pre_dec")
+		RULE CHAR('&') WS NT("cast_expr") TREE("address_of")
+		RULE CHAR('*') WS NT("cast_expr") TREE("deref")
+		RULE CHAR('+') WS NT("cast_expr") TREE("plus")
+		RULE CHAR('-') WS NT("cast_expr") TREE("min")
+		RULE CHAR('~') WS NT("cast_expr") TREE("invert")
+		RULE CHAR('!') WS NT("cast_expr") TREE("not")
+		RULE KEYWORD("sizeof")
+		OPEN
+			RULE NT("unary_expr") TREE("typeof")
+			RULE CHAR('(') WS IDENT CHAR(')') WS
+		CLOSE TREE("sizeof")
+		RULE NT("postfix_expr")
 
 	NT_DEF("cast_expr")
-	RULE CHAR('(') NT("abstract_declaration") CHAR(')') NT("cast_expr") TREE("cast")
-	RULE NT("unary_expr")
+		RULE CHAR('(') WS NT("abstract_declaration") CHAR(')') WS NT("cast_expr") TREE("cast")
+		RULE NT("unary_expr")
 
 	NT_DEF("l_expr1")
-	RULE NT("cast_expr")
-	REC_RULE WS CHAR('*') WS NT("cast_expr") TREE("times")
-	REC_RULE WS CHAR('/') WS NT("cast_expr") TREE("div")
-	REC_RULE WS CHAR('%') WS NT("cast_expr") TREE("mod")
+		RULE NT("cast_expr")
+		REC_RULE WS CHAR('*') WS NT("cast_expr") TREE("times")
+		REC_RULE WS CHAR('/') WS NT("cast_expr") TREE("div")
+		REC_RULE WS CHAR('%') WS NT("cast_expr") TREE("mod")
 
 	NT_DEF("l_expr2")
-	RULE NT("l_expr1")
-	REC_RULE WS CHAR('+') WS NT("l_expr1") TREE("add")
-	REC_RULE WS CHAR('-') WS NT("l_expr1") TREE("sub")
+		RULE NT("l_expr1")
+		REC_RULE WS CHAR('+') WS NT("l_expr1") TREE("add")
+		REC_RULE WS CHAR('-') WS NT("l_expr1") TREE("sub")
 
 	NT_DEF("l_expr3")
-	RULE NT("l_expr2")
-	REC_RULE WS CHAR('<') CHAR('<') WS NT("l_expr2") TREE("ls")
-	REC_RULE WS CHAR('>') CHAR('>') WS NT("l_expr2") TREE("rs")
+		RULE NT("l_expr2")
+		REC_RULE WS CHAR('<') CHAR('<') WS NT("l_expr2") TREE("ls")
+		REC_RULE WS CHAR('>') CHAR('>') WS NT("l_expr2") TREE("rs")
 
 	NT_DEF("l_expr4")
-	RULE NT("l_expr3")
-	REC_RULE WS CHAR('<') CHAR('=') WS NT("l_expr3") TREE("le")
-	REC_RULE WS CHAR('>') CHAR('=') WS NT("l_expr3") TREE("ge")
-	REC_RULE WS CHAR('<') WS NT("l_expr3") TREE("lt")
-	REC_RULE WS CHAR('>') WS NT("l_expr3") TREE("gt")
-	REC_RULE WS CHAR('=') CHAR('=') WS NT("l_expr3") TREE("eq")
-	REC_RULE WS CHAR('!') CHAR('=') WS NT("l_expr3") TREE("ne")
+		RULE NT("l_expr3")
+		REC_RULE WS CHAR('<') CHAR('=') WS NT("l_expr3") TREE("le")
+		REC_RULE WS CHAR('>') CHAR('=') WS NT("l_expr3") TREE("ge")
+		REC_RULE WS CHAR('<') WS NT("l_expr3") TREE("lt")
+		REC_RULE WS CHAR('>') WS NT("l_expr3") TREE("gt")
+		REC_RULE WS CHAR('=') CHAR('=') WS NT("l_expr3") TREE("eq")
+		REC_RULE WS CHAR('!') CHAR('=') WS NT("l_expr3") TREE("ne")
 
 	NT_DEF("l_expr5")
-	RULE NT("l_expr4")
-	REC_RULE WS CHAR('^') WS NT("l_expr4") TREE("bexor")
+		RULE NT("l_expr4")
+		REC_RULE WS CHAR('^') WS NT("l_expr4") TREE("bexor")
 
 	NT_DEF("l_expr6")
-	RULE NT("l_expr5")
-	REC_RULE WS CHAR('&') WS NT("l_expr5") TREE("land")
+		RULE NT("l_expr5")
+		REC_RULE WS CHAR('&') WS NT("l_expr5") TREE("land")
 
 	NT_DEF("l_expr7")
-	RULE NT("l_expr6")
-	REC_RULE WS CHAR('|') WS NT("l_expr6") TREE("lor")
+		RULE NT("l_expr6")
+		REC_RULE WS CHAR('|') WS NT("l_expr6") TREE("lor")
 
 	NT_DEF("l_expr8")
-	RULE NT("l_expr7")
-	REC_RULE WS CHAR('&') CHAR('&') WS NT("l_expr7") TREE("and")
+		RULE NT("l_expr7")
+		REC_RULE WS CHAR('&') CHAR('&') WS NT("l_expr7") TREE("and")
 
 	NT_DEF("l_expr9")
-	RULE NT("l_expr8")
-	REC_RULE WS CHAR('|') CHAR('|') WS NT("l_expr8") TREE("or")
+		RULE NT("l_expr8")
+		REC_RULE WS CHAR('|') CHAR('|') WS NT("l_expr8") TREE("or")
 
 	NT_DEF("conditional_expr")
-	RULE NT("l_expr9") WS CHAR('?') WS NT("l_expr9") WS CHAR(':') WS NT("conditional_expr") TREE("if_expr")
-	RULE NT("l_expr9")
+		RULE NT("l_expr9") WS CHAR('?') WS NT("l_expr9") WS CHAR(':') WS NT("conditional_expr") TREE("if_expr")
+		RULE NT("l_expr9")
 
 	NT_DEF("assignment_expr")
-	RULE NT("unary_expr") WS NT("assignment_operator") WS NT("assignment_expr") TREE("assignment")
-	RULE NT("conditional_expr")
+		RULE NT("unary_expr") WS NT("assignment_operator") WS NT("assignment_expr") TREE("assignment")
+		RULE NT("conditional_expr")
 
 	NT_DEF("assignment_operator")
-	RULE CHAR('=') TREE("ass")
-	RULE CHAR('*') CHAR('=') TREE("times_ass")
-	RULE CHAR('/') CHAR('=') TREE("div_ass")
-	RULE CHAR('%') CHAR('=') TREE("mod_ass")
-	RULE CHAR('+') CHAR('=') TREE("add_ass")
-	RULE CHAR('-') CHAR('=') TREE("sub_ass")
-	RULE CHAR('<') CHAR('<') CHAR('=') TREE("sl_ass")
-	RULE CHAR('>') CHAR('>') CHAR('=') TREE("sr_ass")
-	RULE CHAR('&') CHAR('=') TREE("and_ass")
-	RULE CHAR('|') CHAR('=') TREE("or_ass")
-	RULE CHAR('^') CHAR('=') TREE("exor_ass")
+		RULE CHAR('=') TREE("ass")
+		RULE CHAR('*') CHAR('=') WS TREE("times_ass")
+		RULE CHAR('/') CHAR('=') WS TREE("div_ass")
+		RULE CHAR('%') CHAR('=') WS TREE("mod_ass")
+		RULE CHAR('+') CHAR('=') WS TREE("add_ass")
+		RULE CHAR('-') CHAR('=') WS TREE("sub_ass")
+		RULE CHAR('<') CHAR('<') CHAR('=') WS TREE("sl_ass")
+		RULE CHAR('>') CHAR('>') CHAR('=') WS TREE("sr_ass")
+		RULE CHAR('&') CHAR('=') WS TREE("and_ass")
+		RULE CHAR('|') CHAR('=') WS TREE("or_ass")
+		RULE CHAR('^') CHAR('=') WS TREE("exor_ass")
 
 	NT_DEF("expr")
-	RULE NT("assignment_expr") CHAIN(",")
+		RULE NT("assignment_expr") CHAIN(0,0) CHAR(",") WS CLOSE
 
 	NT_DEF("constant_expr")
-	RULE NT("conditional_expr")
+		RULE NT("conditional_expr")
 
 	NT_DEF("declaration")
-	RULE
-	OPEN
-		RULE NT("storage_class_specifier")
-		RULE NT("type_specifier")
-	CLOSE SEQL OPTN AVOID
-	OPEN
 		RULE
 		OPEN
-			RULE NT("declarator")
-			OPEN
-				RULE WS CHAR('=') WS NT("initializer")
-			CLOSE OPTN
-		CLOSE CHAIN(",") OPTN CHAR(';') TREE("decl")
-		RULE NT("func_declarator") CHAR('(') NT("parameter_declaration_list") OPTN CHAR(')')
+			RULE NT("storage_class_specifier")
+			RULE NT("type_specifier")
+		CLOSE SEQL OPTN AVOID
 		OPEN
-			RULE CHAR(';')
-			RULE CHAR('{') NT("decl_or_stat") CHAR('}')
-		CLOSE TREE("new_style")
-		RULE NT("func_declarator") CHAR('(') NT("ident_list") OPTN CHAR(')') NT("declaration") SEQL OPTN CHAR('{') NT("decl_or_stat") CHAR('}') TREE("old_style")
-	CLOSE
+			RULE
+			OPEN
+				RULE NT("declarator")
+				OPEN
+					RULE WS CHAR('=') WS NT("initializer")
+				CLOSE OPTN
+			CLOSE CHAIN(0,0) CHAR(",") WS CLOSE OPTN CHAR(';') TREE("decl")
+			RULE NT("func_declarator") CHAR('(') NT("parameter_declaration_list") OPTN CHAR(')')
+			OPEN
+				RULE CHAR(';')
+				RULE CHAR('{') NT("decl_or_stat") CHAR('}')
+			CLOSE TREE("new_style")
+			RULE NT("func_declarator") CHAR('(') NT("ident_list") OPTN CHAR(')') NT("declaration") SEQL OPTN CHAR('{') NT("decl_or_stat") CHAR('}') TREE("old_style")
+		CLOSE
 
 	NT_DEF("storage_class_specifier")
-	RULE KEYWORD("typedef") TREE("typedef")
-	RULE KEYWORD("extern") TREE("extern")
-	RULE KEYWORD("static") TREE("static")
-	RULE KEYWORD("auto") TREE("auto")
-	RULE KEYWORD("register") TREE("register")
+		RULE KEYWORD("typedef") TREE("typedef")
+		RULE KEYWORD("extern") TREE("extern")
+		RULE KEYWORD("static") TREE("static")
+		RULE KEYWORD("auto") TREE("auto")
+		RULE KEYWORD("register") TREE("register")
 
 	NT_DEF("type_specifier")
-	RULE KEYWORD("char") TREE("char")
-	RULE KEYWORD("short") TREE("short")
-	RULE KEYWORD("int") TREE("int")
-	RULE KEYWORD("long") TREE("long")
-	RULE KEYWORD("signed") TREE("signed")
-	RULE KEYWORD("unsigned") TREE("unsigned")
-	RULE KEYWORD("float") TREE("float")
-	RULE KEYWORD("double") TREE("double")
-	RULE KEYWORD("const") TREE("const")
-	RULE KEYWORD("volatile") TREE("volatile")
-	RULE KEYWORD("void") TREE("void")
-	RULE NT("struct_or_union_specifier")
-	RULE NT("enum_specifier")
-	RULE IDENT
+		RULE KEYWORD("char") TREE("char")
+		RULE KEYWORD("short") TREE("short")
+		RULE KEYWORD("int") TREE("int")
+		RULE KEYWORD("long") TREE("long")
+		RULE KEYWORD("signed") TREE("signed")
+		RULE KEYWORD("unsigned") TREE("unsigned")
+		RULE KEYWORD("float") TREE("float")
+		RULE KEYWORD("double") TREE("double")
+		RULE KEYWORD("const") TREE("const")
+		RULE KEYWORD("volatile") TREE("volatile")
+		RULE KEYWORD("void") TREE("void")
+		RULE NT("struct_or_union_specifier")
+		RULE NT("enum_specifier")
+		RULE IDENT
 
 	NT_DEF("struct_or_union_specifier")
-	RULE KEYWORD("struct") IDENT CHAR('{')
-	OPEN
-		RULE NT("struct_declaration")
-	CLOSE SEQL CHAR('}') TREE("struct_d")
-	RULE KEYWORD("struct") CHAR('{')
-	OPEN
-		RULE NT("struct_declaration")
-	CLOSE SEQL CHAR('}') TREE("struct_n")
-	RULE KEYWORD("struct") IDENT TREE("struct")
-	RULE KEYWORD("union") IDENT CHAR('{')
-	OPEN
-		RULE NT("struct_declaration")
-	CLOSE SEQL CHAR('}') TREE("union_d")
-	RULE KEYWORD("union") CHAR('{')
-	OPEN
-		RULE NT("struct_declaration")
-	CLOSE SEQL CHAR('}') TREE("union_n")
-	RULE KEYWORD("union") IDENT TREE("union")
+		RULE KEYWORD("struct") IDENT CHAR('{')
+		OPEN
+			RULE NT("struct_declaration")
+		CLOSE SEQL CHAR('}') TREE("struct_d")
+		RULE KEYWORD("struct") CHAR('{')
+		OPEN
+			RULE NT("struct_declaration")
+		CLOSE SEQL CHAR('}') TREE("struct_n")
+		RULE KEYWORD("struct") IDENT TREE("struct")
+		RULE KEYWORD("union") IDENT CHAR('{')
+		OPEN
+			RULE NT("struct_declaration")
+		CLOSE SEQL CHAR('}') TREE("union_d")
+		RULE KEYWORD("union") CHAR('{')
+		OPEN
+			RULE NT("struct_declaration")
+		CLOSE SEQL CHAR('}') TREE("union_n")
+		RULE KEYWORD("union") IDENT TREE("union")
 
 	NT_DEF("struct_declaration")
-	RULE NT("type_specifier") NT("struct_declaration") TREE("type")
-	RULE NT("struct_declarator") CHAIN(",") CHAR(';') TREE("strdec")
+		RULE NT("type_specifier") NT("struct_declaration") TREE("type")
+		RULE NT("struct_declarator") CHAIN(0,0) CHAR(",") WS CLOSE CHAR(';') TREE("strdec")
 
 	NT_DEF("struct_declarator")
-	RULE NT("declarator")
-	OPEN
-		RULE CHAR(':') NT("constant_expr")
-	CLOSE OPTN TREE("record_field")
+		RULE NT("declarator")
+		OPEN
+			RULE CHAR(':') NT("constant_expr")
+		CLOSE OPTN TREE("record_field")
 
 	NT_DEF("enum_specifier")
-	RULE KEYWORD("enum") IDENT
-	OPEN
-		RULE CHAR('{') NT("enumerator") CHAIN(",") CHAR('}')
-	CLOSE TREE("enum")
+		RULE KEYWORD("enum") IDENT
+		OPEN
+			RULE CHAR('{') NT("enumerator") CHAIN(0,0) CHAR(",") WS CLOSE CHAR('}')
+		CLOSE TREE("enum")
 
 	NT_DEF("enumerator")
-	RULE IDENT
-	OPEN
-		RULE CHAR('=') NT("constant_expr")
-	CLOSE OPTN TREE("enumerator")
+		RULE IDENT
+		OPEN
+			RULE CHAR('=') NT("constant_expr")
+		CLOSE OPTN TREE("enumerator")
 
 	NT_DEF("func_declarator")
-	RULE CHAR('*')
-	OPEN
-		RULE KEYWORD("const") TREE("const")
-	CLOSE OPTN NT("func_declarator") TREE("pointdecl")
-	RULE KEYWORD("(") NT("func_declarator") CHAR(')')
-	RULE IDENT
+		RULE CHAR('*')
+		OPEN
+			RULE KEYWORD("const") TREE("const")
+		CLOSE OPTN NT("func_declarator") TREE("pointdecl")
+		RULE KEYWORD("(") NT("func_declarator") CHAR(')')
+		RULE IDENT
 
 	NT_DEF("declarator")
-	RULE CHAR('*')
-	OPEN
-		RULE KEYWORD("const") TREE("const")
-	CLOSE OPTN NT("declarator") TREE("pointdecl")
-	RULE CHAR('(') NT("declarator") CHAR(')') TREE("brackets")
-	RULE WS IDENT
-	REC_RULE CHAR('[') NT("constant_expr") OPTN CHAR(']') TREE("array")
-	REC_RULE CHAR('(') NT("abstract_declaration_list") OPTN CHAR(')') TREE("function")
+		RULE CHAR('*')
+		OPEN
+			RULE KEYWORD("const") TREE("const")
+		CLOSE OPTN NT("declarator") TREE("pointdecl")
+		RULE CHAR('(') NT("declarator") CHAR(')') TREE("brackets")
+		RULE WS IDENT
+		REC_RULE CHAR('[') NT("constant_expr") OPTN CHAR(']') TREE("array")
+		REC_RULE CHAR('(') NT("abstract_declaration_list") OPTN CHAR(')') TREE("function")
 
 	NT_DEF("abstract_declaration_list")
-	RULE NT("abstract_declaration")
-	OPEN
-		RULE CHAR(',')
+		RULE NT("abstract_declaration")
 		OPEN
-			RULE CHAR('.') CHAR('.') CHAR('.') TREE("varargs")
-			RULE NT("abstract_declaration_list")
-		CLOSE
-	CLOSE OPTN
+			RULE CHAR(',')
+			OPEN
+				RULE CHAR('.') CHAR('.') CHAR('.') TREE("varargs")
+				RULE NT("abstract_declaration_list")
+			CLOSE
+		CLOSE OPTN
 
 	NT_DEF("parameter_declaration_list")
-	RULE NT("parameter_declaration")
-	OPEN
-		RULE CHAR(',')
+		RULE NT("parameter_declaration")
 		OPEN
-			RULE CHAR('.') CHAR('.') CHAR('.') TREE("varargs")
-			RULE NT("parameter_declaration_list")
-		CLOSE
-	CLOSE OPTN
+			RULE CHAR(',')
+			OPEN
+				RULE CHAR('.') CHAR('.') CHAR('.') TREE("varargs")
+				RULE NT("parameter_declaration_list")
+			CLOSE
+		CLOSE OPTN
 
 	NT_DEF("ident_list")
-	RULE IDENT
-	OPEN
-		RULE CHAR(',')
+		RULE IDENT
 		OPEN
-			RULE CHAR('.') CHAR('.') CHAR('.') TREE("varargs")
-			RULE NT("ident_list")
-		CLOSE
-	CLOSE OPTN
+			RULE CHAR(',')
+			OPEN
+				RULE CHAR('.') CHAR('.') CHAR('.') TREE("varargs")
+				RULE NT("ident_list")
+			CLOSE
+		CLOSE OPTN
 
 	NT_DEF("parameter_declaration")
-	RULE NT("type_specifier") NT("parameter_declaration") TREE("type")
-	RULE NT("declarator")
-	RULE NT("abstract_declarator")
+		RULE NT("type_specifier") NT("parameter_declaration") TREE("type")
+		RULE NT("declarator")
+		RULE NT("abstract_declarator")
 
 	NT_DEF("abstract_declaration")
-	RULE NT("type_specifier") NT("parameter_declaration") TREE("type")
-	RULE NT("abstract_declarator")
+		RULE NT("type_specifier") NT("parameter_declaration") TREE("type")
+		RULE NT("abstract_declarator")
 
 	NT_DEF("abstract_declarator")
-	RULE CHAR('*')
-	OPEN
-		RULE KEYWORD("const") TREE("const")
-	CLOSE OPTN NT("abstract_declarator") TREE("abs_pointdecl")
-	RULE CHAR('(') NT("abstract_declarator") CHAR(')') TREE("abs_brackets")
-	RULE
-	REC_RULE CHAR('[') NT("constant_expr") OPTN CHAR(']') TREE("abs_array")
-	REC_RULE CHAR('(') NT("parameter_declaration_list") CHAR(')') TREE("abs_func")
+		RULE CHAR('*')
+		OPEN
+			RULE KEYWORD("const") TREE("const")
+		CLOSE OPTN NT("abstract_declarator") TREE("abs_pointdecl")
+		RULE CHAR('(') NT("abstract_declarator") CHAR(')') TREE("abs_brackets")
+		RULE
+		REC_RULE CHAR('[') NT("constant_expr") OPTN CHAR(']') TREE("abs_array")
+		REC_RULE CHAR('(') NT("parameter_declaration_list") CHAR(')') TREE("abs_func")
 
 	NT_DEF("initializer")
-	RULE NT("assignment_expr")
-	RULE CHAR('{') NT("initializer") CHAIN(",") CHAR(',') OPTN CHAR('}') TREE("initializer")
+		RULE NT("assignment_expr")
+		RULE CHAR('{') NT("initializer") CHAIN(0,0) CHAR(",") WS CLOSE CHAR(',') OPTN CHAR('}') TREE("initializer")
 
 	NT_DEF("decl_or_stat")
-	RULE NT("declaration") SEQL OPTN NT("statement") SEQL OPTN
+		RULE NT("declaration") SEQL OPTN NT("statement") SEQL OPTN
 
 	NT_DEF("statement")
-	RULE
-	OPEN
 		RULE
 		OPEN
-			RULE IDENT
-			RULE KEYWORD("case") NT("constant_expr")
-			RULE KEYWORD("default")
-		CLOSE CHAR(':') NT("statement") TREE("label")
-		RULE CHAR('{') NT("decl_or_stat") CHAR('}') TREE("brackets")
-	CLOSE
-	RULE
-	OPEN
-		RULE NT("expr") OPTN CHAR(';')
-		RULE KEYWORD("if") WS CHAR('(') NT("expr") CHAR(')') NT("statement")
+			RULE
+			OPEN
+				RULE IDENT
+				RULE KEYWORD("case") NT("constant_expr")
+				RULE KEYWORD("default")
+			CLOSE CHAR(':') NT("statement") TREE("label")
+			RULE CHAR('{') NT("decl_or_stat") CHAR('}') TREE("brackets")
+		CLOSE
+		RULE
 		OPEN
-			RULE KEYWORD("else") NT("statement")
-		CLOSE OPTN TREE("if")
-		RULE KEYWORD("switch") WS CHAR('(') NT("expr") CHAR(')') NT("statement") TREE("switch")
-		RULE KEYWORD("while") WS CHAR('(') NT("expr") CHAR(')') NT("statement") TREE("while")
-		RULE KEYWORD("do") NT("statement") KEYWORD("while") WS CHAR('(') NT("expr") CHAR(')') CHAR(';') TREE("do")
-		RULE KEYWORD("for") WS CHAR('(') NT("expr") OPTN CHAR(';')
-		OPEN
-			RULE WS NT("expr")
-		CLOSE OPTN CHAR(';')
-		OPEN
-			RULE WS NT("expr")
-		CLOSE OPTN CHAR(')') NT("statement") TREE("for")
-		RULE KEYWORD("goto") IDENT CHAR(';') TREE("goto")
-		RULE KEYWORD("continue") CHAR(';') TREE("cont")
-		RULE KEYWORD("break") CHAR(';') TREE("break")
-		RULE KEYWORD("return") NT("expr") OPTN CHAR(';') TREE("ret")
-	CLOSE
+			RULE NT("expr") OPTN CHAR(';')
+			RULE KEYWORD("if") WS CHAR('(') NT("expr") CHAR(')') NT("statement")
+			OPEN
+				RULE KEYWORD("else") NT("statement")
+			CLOSE OPTN TREE("if")
+			RULE KEYWORD("switch") WS CHAR('(') NT("expr") CHAR(')') NT("statement") TREE("switch")
+			RULE KEYWORD("while") WS CHAR('(') NT("expr") CHAR(')') NT("statement") TREE("while")
+			RULE KEYWORD("do") NT("statement") KEYWORD("while") WS CHAR('(') NT("expr") CHAR(')') CHAR(';') TREE("do")
+			RULE KEYWORD("for") WS CHAR('(') NT("expr") OPTN CHAR(';')
+			OPEN
+				RULE WS NT("expr")
+			CLOSE OPTN CHAR(';')
+			OPEN
+				RULE WS NT("expr")
+			CLOSE OPTN CHAR(')') NT("statement") TREE("for")
+			RULE KEYWORD("goto") IDENT CHAR(';') TREE("goto")
+			RULE KEYWORD("continue") CHAR(';') TREE("cont")
+			RULE KEYWORD("break") CHAR(';') TREE("break")
+			RULE KEYWORD("return") NT("expr") OPTN CHAR(';') TREE("ret")
+		CLOSE
 
 	NT_DEF("root")
-	RULE
-	OPEN
-		RULE NT("declaration")
-	CLOSE SEQL OPTN END
+		RULE
+		OPEN
+			RULE NT("declaration")
+		CLOSE SEQL OPTN END
 }
 
 
